@@ -1287,213 +1287,216 @@ const xlsxFile = ref<File | null>(null);
 const xlsxImportProgress = ref(0);
 const xlsxImportTotal = ref(0);
 const xlsxImportResults = ref<Array<{ success: boolean; message: string; orderData?: any }>>([]);
+const isXlsxProcessing = ref(false);
 
 // 处理文件选择
 const handleXlsxFileChange = (event: Event) => {
   const target = event.target as HTMLInputElement;
   if (target.files && target.files.length > 0) {
     xlsxFile.value = target.files[0];
+    xlsxImportProgress.value = 0;
+    xlsxImportTotal.value = 0;
+    xlsxImportResults.value = [];
+    target.value = '';
     ElMessage.success(`已选择文件: ${xlsxFile.value.name}`);
   }
 };
 
-// 解析饮品字符串，提取商品名称
-// 格式：【类别】商品名：价格
-// 多杯格式：【类别】商品名：价格 | 【类别】商品名：价格 或 【类别】商品名：价格】【类别】商品名：价格
-// 提取方法：找到所有 】 和 ： 之间的内容（可能包含【类别】前缀，需要去除）
+// 解析饮品字符串，提取产品名称
 const parseDrinkString = (drinkStr: string): string[] => {
   if (!drinkStr) return [];
-  
+
   const drinks: string[] = [];
-  
-  // 使用正则表达式匹配所有 】 和 ： 之间的内容
-  // 模式：】后面跟任意字符（排除【），直到遇到：
-  const pattern = /】([^：]+?)：/g;
+  const normalized = drinkStr.replace(/\s+/g, ' ');
+
+  const pattern = /】([^：:]+)[：:]/g;
   let match;
-  
-  while ((match = pattern.exec(drinkStr)) !== null) {
-    let productName = match[1].trim();
-    // 去除可能存在的【类别】前缀（如果有的话）
-    if (productName.includes('【') && productName.includes('】')) {
-      productName = productName.split('】').pop()?.trim() || productName;
-    }
-    if (productName) {
-      drinks.push(productName);
-    }
+  while ((match = pattern.exec(normalized)) !== null) {
+    const name = match[1]?.trim();
+    if (name) drinks.push(name);
   }
-  
+
+  if (drinks.length === 0) {
+    normalized.split(/[，,|、]/).forEach((part) => {
+      const clean = part.replace(/【[^】]*】/g, '').replace(/[：:].*/, '').trim();
+      if (clean) drinks.push(clean);
+    });
+  }
+
   return drinks;
 };
 
-// 检测温度：检查字符串中是否包含"热"或"冰"
+// 解析温度，兼容冰/热/常温
 const detectTemperature = (tempStr: string): string | null => {
   if (!tempStr) return null;
-  
-  if (tempStr.includes('热')) {
-    return '热';
-  } else if (tempStr.includes('少冰')) {
-    return '少冰';
-  } else if (tempStr.includes('冰')) {
-    return '冰';
-  }
-  
+  const normalized = tempStr.replace(/[！!]/g, '').trim();
+
+  if (normalized.includes('冰')) return '冰';
+  if (normalized.includes('常温')) return '常温';
+  if (normalized.includes('热') || normalized.includes('温')) return normalized.includes('热') ? '热' : '温';
   return null;
 };
 
-// 检测是否需要燕麦奶
+// 是否加燕麦奶
 const shouldAddOatMilk = (oatMilkStr: string): boolean => {
   if (!oatMilkStr || oatMilkStr.trim() === '') {
     return false;
   }
-  
-  // 如果包含"不"或"否"，则不添加燕麦奶
-  if (oatMilkStr.includes('不') || oatMilkStr.includes('否')) {
-    return false;
-  }
-  
-  return true;
+  const normalized = oatMilkStr.replace(/[！!。.\s]/g, '');
+
+  if (normalized.includes('不') || normalized.includes('无')) return false;
+
+  return normalized.includes('换') || normalized.includes('要') || normalized.includes('加');
 };
 
-// 解析配送地点
-// 格式：北大：二教 或 咖啡—燕园：#7 图书馆南门
-const parseDeliveryLocation = (locationStr: string): { school: string; address: string } => {
-  if (!locationStr) {
-    return { school: '', address: '' };
+// Parse delivery location (column 4/5)
+const parseDeliveryLocation = (locationMain: string, locationExtra?: string): { school: string; address: string } => {
+  const main = (locationMain || '').trim();
+  const extra = (locationExtra || '').trim();
+
+  if (!main && !extra) return { school: '', address: '' };
+
+  let school = main;
+  let address = '';
+
+  const separator = main.includes('：') ? '：' : main.includes(':') ? ':' : '';
+  if (separator) {
+    const parts = main.split(separator);
+    school = parts[0].trim();
+    address = parts.slice(1).join(separator).trim();
   }
-  
-  // 先尝试按 "：" 分割
-  if (locationStr.includes('：')) {
-    const parts = locationStr.split('：');
-    return {
-      school: parts[0].trim(),
-      address: parts[1]?.trim() || ''
-    };
+
+  if (extra) {
+    address = extra;
   }
-  
-  // 如果没有冒号，尝试按 ":" 分割
-  if (locationStr.includes(':')) {
-    const parts = locationStr.split(':');
-    return {
-      school: parts[0].trim(),
-      address: parts[1]?.trim() || ''
-    };
+
+  if (!school && address) {
+    school = main || address;
   }
-  
-  // 如果都没有，整个字符串作为 school
-  return {
-    school: locationStr.trim(),
-    address: ''
-  };
+
+  return { school, address };
 };
 
-// 处理 XLSX 文件并导入订单
+// Parse time cell, support text and Excel serial numbers
+const parseTimeToIsoString = (timeCell: any): string => {
+  if (timeCell === undefined || timeCell === null || timeCell === '') {
+    throw new Error('缺少送达时间');
+  }
+
+  if (typeof timeCell === 'number' && XLSX.SSF && XLSX.SSF.parse_date_code) {
+    const parsed = XLSX.SSF.parse_date_code(timeCell);
+    if (parsed) {
+      const date = new Date(
+        parsed.y,
+        (parsed.m || 1) - 1,
+        parsed.d || 1,
+        parsed.H || 0,
+        parsed.M || 0,
+        parsed.S || 0
+      );
+      return date.toISOString();
+    }
+  }
+
+  const normalized = timeCell.toString().replace(/：/g, ':').trim();
+  const date = new Date(normalized);
+  if (isNaN(date.getTime())) {
+    throw new Error(`无效的送达时间格式：${timeCell}`);
+  }
+
+  return date.toISOString();
+};
 const processXlsxImport = async () => {
   if (!xlsxFile.value) {
     ElMessage.error('请先选择 XLSX 文件');
     return;
   }
-  
+
+  isXlsxProcessing.value = true;
   try {
-    // 读取文件
     const fileData = await xlsxFile.value.arrayBuffer();
     const workbook = XLSX.read(fileData);
-    
-    // 读取第一个 sheet
+
     const firstSheetName = workbook.SheetNames[0];
     const worksheet = workbook.Sheets[firstSheetName];
-    
-    // 转换为 JSON（数组格式，保留原始结构）
+
     const data: any[][] = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
-    
+
     if (data.length <= 1) {
       ElMessage.error('XLSX 文件没有数据行');
       return;
     }
-    
-    // 跳过标题行，从第二行开始处理
-    const dataRows = data.slice(1);
-    
+
+    const dataRows = data
+      .slice(1)
+      .filter(row => row.some(cell => cell !== undefined && cell !== null && cell !== ''));
+
     xlsxImportTotal.value = dataRows.length;
     xlsxImportProgress.value = 0;
     xlsxImportResults.value = [];
-    
+
     const str = localStorage.getItem(USER_DTO);
     const userDTO = JSON.parse(str as string) as UserDTO;
-    
+
     for (const [index, row] of dataRows.entries()) {
       try {
-        // 解析每一行
-        // 列索引：0=序号, 1=时间, 2=地点, 3=饮品, 4=冰热, 5=燕麦奶
-        const timeStr = row[1]?.toString().trim();
-        const locationStr = row[2]?.toString().trim();
-        const drinkStr = row[3]?.toString().trim();
-        const tempStr = row[4]?.toString().trim();
-        const oatMilkStr = row[5]?.toString().trim();
-        
-        if (!timeStr || !locationStr || !drinkStr) {
-          throw new Error('缺少必要字段：时间、地点或饮品');
+        // 新模板列顺序：3=地点、4=补充地点、5=送达时间、6=饮品、7=冰/热、8=燕麦奶
+        const locationMain = row[3]?.toString().trim() || '';
+        const locationExtra = row[4]?.toString().trim() || '';
+        const timeCell = row[5];
+        const drinkStr = row[6]?.toString().trim() || '';
+        const tempStr = row[7]?.toString().trim() || '';
+        const oatMilkStr = row[8]?.toString().trim() || '';
+
+        if ((!locationMain && !locationExtra) || !timeCell || !drinkStr) {
+          throw new Error('缺少必填字段：时间、地点、饮品');
         }
-        
-        // 解析时间（处理中文冒号）
-        const normalizedTime = timeStr.replace(/：/g, ':');
-        const date = new Date(normalizedTime);
-        if (isNaN(date.getTime())) {
-          throw new Error(`无效的时间格式：${timeStr}`);
-        }
-        const isoTime = date.toISOString();
-        
-        // 解析地点
-        const location = parseDeliveryLocation(locationStr);
+
+        const isoTime = parseTimeToIsoString(timeCell);
+
+        const location = parseDeliveryLocation(locationMain, locationExtra);
         if (!location.school) {
-          throw new Error(`无效的地点格式：${locationStr}`);
+          throw new Error(`无效的送达地点：${locationMain || locationExtra}`);
         }
-        
-        // 解析饮品
+
         const productNames = parseDrinkString(drinkStr);
         if (productNames.length === 0) {
           throw new Error(`无法解析饮品：${drinkStr}`);
         }
-        
-        // 检测温度
+
         const temperature = detectTemperature(tempStr);
-        
-        // 检测燕麦奶
         const needOatMilk = shouldAddOatMilk(oatMilkStr);
-        
-        // 构建订单商品列表
+
         const items: Array<{ productId: string; optionValues: Record<string, string> }> = [];
-        
+
         for (const productName of productNames) {
           const product = findProductByName(productName);
           if (!product?.id) {
             throw new Error(`找不到商品：${productName}`);
           }
-          
+
           const optionValues: Record<string, string> = {};
-          
-          // 添加温度选项
+
           if (temperature) {
             const tempOption = findOptionValueByName('温度', temperature);
             if (tempOption) {
               optionValues[tempOption.optionId] = tempOption.uuid;
             }
           }
-          
-          // 添加燕麦奶选项
+
           if (needOatMilk) {
-            const oatMilkOption = findOptionValueByName('换燕麦奶', '燕麦奶');
+            const oatMilkOption = findOptionValueByName('燕麦奶', '燕麦奶');
             if (oatMilkOption) {
               optionValues[oatMilkOption.optionId] = oatMilkOption.uuid;
             }
           }
-          
+
           items.push({
             productId: product.id,
             optionValues
           });
         }
-        
-        // 创建订单
+
         const orderData: OrderApiParams = {
           userId: userDTO.id,
           scene: '定时达',
@@ -1508,37 +1511,34 @@ const processXlsxImport = async () => {
           },
           remark: ''
         };
-        
+
         await createOrderInStore({ body: orderData });
-        
+
         xlsxImportResults.value.push({
           success: true,
-          message: `第 ${index + 2} 行：订单创建成功 (${productNames.join(', ')})`,
-          orderData: { locationStr, drinkStr, tempStr, productNames }
+          message: `第 ${index + 2} 行，订单创建成功 (${productNames.join(', ')})`,
+          orderData: { locationMain, locationExtra, drinkStr, tempStr, productNames }
         });
-        
-        xlsxImportProgress.value++;
-        
       } catch (error: any) {
         xlsxImportResults.value.push({
           success: false,
           message: `第 ${index + 2} 行失败: ${error.message || error}`,
           orderData: row
         });
+      } finally {
         xlsxImportProgress.value++;
       }
     }
-    
+
     ElMessage.success(`XLSX 导入完成：成功 ${xlsxImportResults.value.filter(r => r.success).length}/${xlsxImportTotal.value}`);
-    await fetchOrders(); // 刷新订单列表
-    
+    await fetchOrders();
   } catch (error: any) {
     console.error('XLSX 导入失败:', error);
     ElMessage.error('XLSX 文件解析失败: ' + error.message);
+  } finally {
+    isXlsxProcessing.value = false;
   }
 };
-
-
 </script>
 
 
@@ -1940,41 +1940,42 @@ const processXlsxImport = async () => {
             >
               <template #default>
                 <ol style="margin: 0; padding-left: 20px;">
-                  <li><strong>仅支持导入定时达订单</strong></li>
-                  <li><strong>XLSX 文件格式要求：</strong>
+                  <li><strong>仅支持导入“定时达”订单</strong>，系统会使用当前登录账号自动下单。</li>
+                  <li><strong>XLSX 列顺序要求</strong>
                     <ul style="margin-top: 5px;">
-                      <li><strong>第1列</strong>：序号（可忽略）</li>
-                      <li><strong>第2列</strong>：定时达时间
-                        <br>格式示例：<code>2025-11-22 10:00</code> 或 <code>2025-11-22 10：00</code>（支持中文冒号）
+                      <li><strong>第 1 - 3 列</strong>（编号、提交人、提交时间）可留空，系统忽略。</li>
+                      <li><strong>第 4 列：定时达地点</strong><br>
+                        推荐格式 <code>学校：收货位置</code>，例如 <code>北大：二教</code>、<code>清华园：紫八三单元</code>。
                       </li>
-                      <li><strong>第3列</strong>：配送地点
-                        <br>格式示例：<code>北大：二教</code> 或 <code>咖啡—燕园：#7 图书馆</code>
-                        <br>系统会自动分割为"学校"和"地址"
+                      <li><strong>第 5 列：补充地点</strong><br>
+                        可填写更详细的送达描述（门牌、楼层等），留空则仅使用第 4 列信息。
                       </li>
-                      <li><strong>第4列</strong>：饮品信息
-                        <br>单杯格式：<code>【美式】葡萄美式：10.8r</code>
-                        <br>多杯格式：<code>【美式】葡萄美式：10.8r | 【奶咖】香蕉拿铁：10.8r</code>
-                        <br>或：<code>【美式】葡萄美式：10.8r】【奶咖】香蕉拿铁：10.8r</code>
-                        <br><em>提取规则：查找 】 和 ： 之间的文字作为商品名</em>
+                      <li><strong>第 6 列：定时达时间</strong><br>
+                        支持 <code>2025-11-22 10:00</code>、<code>2025-11-22 10：00</code>（中文冒号）或 Excel 日期时间单元格。
                       </li>
-                      <li><strong>第5列</strong>：冰热选项
-                        <br>自动识别关键字：<code>热</code>、<code>冰</code>、<code>少冰</code>
-                        <br>示例：<code>冰的！</code>、<code>热的！</code>
+                      <li><strong>第 7 列：饮品信息</strong><br>
+                        示例：<code>【特调】围炉夜话：11.7r</code>；多杯可用中文顿号、逗号或竖线分隔：<code>【巴斯克】栗子：18r, 【美式】玫瑰：13.5r</code>。<br>
+                        系统会提取 “】” 与 “：” 之间的文字作为商品名称。
                       </li>
-                      <li><strong>第6列</strong>：燕麦奶选项
-                        <br>规则：字段非空且不包含"不"或"否"时，自动添加"换燕麦奶"选项
-                        <br>示例：<code>不要！</code>（不添加）、<code>要</code>（添加）
+                      <li><strong>第 8 列：冰 / 热</strong><br>
+                        自动识别 <code>冰</code>、<code>热</code>、<code>常温</code> 等关键词，例如 <code>冰的！</code>、<code>热的！</code>、<code>常温</code>。
+                      </li>
+                      <li><strong>第 9 列：是否换燕麦奶</strong><br>
+                        包含 “换 / 要 / 加” 视为需要燕麦奶，包含 “不 / 无 / 否” 视为不更换，留空默认不更换。
+                      </li>
+                      <li><strong>第 10 列：付款手机号备注</strong><br>
+                        当前版本仅做记录，不会回写到订单，可以留空。
                       </li>
                     </ul>
                   </li>
                   <li><strong>重要提示：</strong>
                     <ul style="margin-top: 5px;">
-                      <li>商品名必须与系统中的商品名<strong>完全一致</strong></li>
-                      <li>系统会自动匹配商品和选项，找不到的商品将导致该订单导入失败</li>
-                      <li>支持一行多杯，每杯可以有不同的商品</li>
+                      <li>饮品名称必须与系统中的商品名称<strong>完全一致</strong>。</li>
+                      <li>温度、燕麦奶等选项由系统自动匹配，若找不到对应选项将导致导入失败。</li>
+                      <li>支持一行多杯，每杯可以是不同商品。</li>
                     </ul>
                   </li>
-                  <li>选择 XLSX 文件后，点击"开始导入 XLSX"</li>
+                  <li>选择 XLSX 文件后，点击“开始导入 XLSX”。</li>
                 </ol>
               </template>
             </el-alert>
@@ -2026,7 +2027,7 @@ const processXlsxImport = async () => {
             <el-button 
               type="primary" 
               @click="processXlsxImport"
-              :disabled="!xlsxFile || xlsxImportProgress > 0"
+              :disabled="!xlsxFile || isXlsxProcessing"
             >
               开始导入 XLSX
             </el-button>
@@ -2226,3 +2227,7 @@ ul {
 
 
 </style>
+
+
+
+
