@@ -1060,30 +1060,64 @@ const openBatchImportDialog = () => {
   batchImportResults.value = [];
 };
 
+const normalizeName = (name: string) => name.toLowerCase().replace(/\s+/g, '');
+
+// 简单 Levenshtein 相似度，返回 0~1
+const similarity = (a: string, b: string): number => {
+  const s = normalizeName(a);
+  const t = normalizeName(b);
+  if (!s.length && !t.length) return 1;
+
+  const dp: number[][] = Array.from({ length: s.length + 1 }, () =>
+    Array(t.length + 1).fill(0)
+  );
+
+  for (let i = 0; i <= s.length; i++) dp[i][0] = i;
+  for (let j = 0; j <= t.length; j++) dp[0][j] = j;
+
+  for (let i = 1; i <= s.length; i++) {
+    for (let j = 1; j <= t.length; j++) {
+      const cost = s[i - 1] === t[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(
+        dp[i - 1][j] + 1, // 删除
+        dp[i][j - 1] + 1, // 插入
+        dp[i - 1][j - 1] + cost // 替换
+      );
+    }
+  }
+
+  const dist = dp[s.length][t.length];
+  return 1 - dist / Math.max(s.length, t.length, 1);
+};
+
 const findProductByName = (productName: string): Product | null => {
   const trimmedName = productName.trim();
-  
-  // 第一步：尝试精确匹配
+
+  // 精确匹配
   const exactMatch = productOptionsList.value.find(p => p.name?.trim() === trimmedName);
-  if (exactMatch) {
-    return exactMatch;
-  }
-  
-  // 第二步：如果没有精确匹配，尝试模糊匹配（但优先匹配完整包含的）
-  const fuzzyMatches = productOptionsList.value.filter(p => 
-    p.name?.includes(trimmedName) || trimmedName.includes(p.name || '')
-  );
-  
-  if (fuzzyMatches.length === 1) {
-    return fuzzyMatches[0];
-  }
-  
-  // 如果有多个模糊匹配，返回 null（要求用户使用精确名称）
-  if (fuzzyMatches.length > 1) {
-    console.warn(`商品名称 "${trimmedName}" 匹配到多个商品: ${fuzzyMatches.map(p => p.name).join(', ')}，请使用精确名称`);
+  if (exactMatch) return exactMatch;
+
+  // 模糊匹配：只接受“问卷里的名字是商品名的子串”的情况
+  const candidates = productOptionsList.value.filter(p => (p.name || '').includes(trimmedName));
+  if (!candidates.length) {
+    console.warn(`商品名称 "${trimmedName}" 未找到合适匹配`);
     return null;
   }
-  
+
+  let best: { product: Product | null; score: number } = { product: null, score: 0 };
+  for (const p of candidates) {
+    const score = similarity(trimmedName, p.name || '');
+    if (score > best.score) {
+      best = { product: p, score };
+    }
+  }
+
+  // 设一个保底阈值，避免误匹配
+  if (best.product && best.score >= 0.45) {
+    return best.product;
+  }
+
+  console.warn(`商品名称 "${trimmedName}" 未找到合适匹配`);
   return null;
 };
 
